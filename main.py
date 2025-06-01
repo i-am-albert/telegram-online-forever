@@ -1,3 +1,4 @@
+# main.py (or keep_online_telethon_env.py)
 import asyncio
 import getpass
 from datetime import datetime
@@ -11,9 +12,13 @@ try:
     print("Loaded environment variables from .env file.")
 except ImportError:
     print("python-dotenv not found. Relying on system environment variables.")
-    pass # python-dotenv is optional
+    pass
+except FileNotFoundError:
+    print(".env file not found. Relying on system environment variables.")
+    pass
 
 from telethon import TelegramClient
+from telethon.sessions import StringSession # Import StringSession
 from telethon.tl.functions.account import UpdateStatusRequest
 from telethon.errors import SessionPasswordNeededError
 
@@ -24,7 +29,6 @@ API_HASH = os.getenv('TELEGRAM_API_HASH')
 
 if not API_ID_STR or not API_HASH:
     print("Error: TELEGRAM_API_ID and TELEGRAM_API_HASH environment variables must be set.")
-    print("You can set them in your system environment or create a .env file in the script's directory.")
     sys.exit(1)
 
 try:
@@ -33,10 +37,14 @@ except ValueError:
     print("Error: TELEGRAM_API_ID must be an integer.")
     sys.exit(1)
 
-# Optional with defaults:
-DEFAULT_SESSION_NAME = 'my_account_online_telethon'
-SESSION_NAME = os.getenv('TELEGRAM_SESSION_NAME', DEFAULT_SESSION_NAME)
+# Session Management:
+# Priority to String Session if available, otherwise use file-based session.
+STRING_SESSION = os.getenv('TELEGRAM_STRING_SESSION')
+DEFAULT_SESSION_NAME = 'my_account_online_telethon' # Used if STRING_SESSION is not set
+SESSION_NAME_FILE = os.getenv('TELEGRAM_SESSION_NAME', DEFAULT_SESSION_NAME)
 
+
+# Optional Behavior Configuration with defaults:
 DEFAULT_UPDATE_INTERVAL_MINUTES = 5
 try:
     UPDATE_INTERVAL_MINUTES = int(os.getenv('TELEGRAM_UPDATE_INTERVAL_MINUTES', DEFAULT_UPDATE_INTERVAL_MINUTES))
@@ -50,27 +58,48 @@ except ValueError:
 
 async def main():
     print("Initializing Telethon Client...")
-    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+    client = None
+
+    if STRING_SESSION:
+        print("Found TELEGRAM_STRING_SESSION. Initializing client with StringSession.")
+        try:
+            client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+        except Exception as e:
+            print(f"Error initializing client with StringSession: {e}")
+            print("Please ensure the TELEGRAM_STRING_SESSION is valid.")
+            sys.exit(1)
+    else:
+        print(f"No TELEGRAM_STRING_SESSION found. Initializing client with file-based session: {SESSION_NAME_FILE}")
+        client = TelegramClient(SESSION_NAME_FILE, API_ID, API_HASH)
+
+    if client is None:
+        print("Fatal: Client could not be initialized.")
+        sys.exit(1)
 
     try:
         print("Connecting to Telegram...")
         await client.connect()
 
         if not await client.is_user_authorized():
-            print("First run: Authorization required.")
-            phone_number = input("Enter your phone number (e.g., +1234567890): ")
-            await client.send_code_request(phone_number)
-            try:
-                await client.sign_in(phone_number, input('Enter the code you received: '))
-            except SessionPasswordNeededError:
-                password = getpass.getpass("Two-factor authentication is enabled. Enter your password: ")
-                await client.sign_in(password=password)
-            except Exception as e:
-                print(f"Failed to sign in: {e}")
+            # This block is for file-based sessions or if string session is invalid/expired
+            # It should ideally NOT run on a server environment if STRING_SESSION is correctly set.
+            if STRING_SESSION:
+                print("Error: Not authorized. The provided TELEGRAM_STRING_SESSION might be invalid or expired.")
+                print("Please generate a new string session locally and update the environment variable.")
+                return # Exit if string session auth fails
+            else:
+                # Interactive login for file-based session (local development)
+                print("Authorization required (file-based session or first run).")
+                print("This script is intended for non-interactive environments when TELEGRAM_STRING_SESSION is set.")
+                print("If running on a server, ensure TELEGRAM_STRING_SESSION is correctly configured.")
+                # Attempting interactive login is likely to fail in non-interactive environments.
+                # We will not include the input() calls here for server safety.
+                # If you need to run this locally and authenticate for the first time with a file session,
+                # you'd re-add the input() based login flow here.
+                print("Cannot proceed with interactive login in this environment. Please authenticate locally first if using file session, or use String Session.")
                 return
-        else:
-            print("Successfully authorized from existing session.")
 
+        print("Successfully authorized.")
         me = await client.get_me()
         if me:
             print(f"Logged in as: {me.first_name} (ID: {me.id})")
@@ -78,9 +107,12 @@ async def main():
             print("Could not get user information. Exiting.")
             return
 
-        print(f"Using session file: {SESSION_NAME}.session")
+        if STRING_SESSION:
+            print("Using String Session for authentication.")
+        else:
+            print(f"Using session file: {client.session.filename}")
         print(f"Will send online status updates every {UPDATE_INTERVAL_MINUTES} minutes.")
-        print("Press Ctrl+C to stop.")
+        print("Press Ctrl+C to stop (if running locally).")
 
         while True:
             try:
@@ -88,7 +120,8 @@ async def main():
                     print("Client disconnected, attempting to reconnect...")
                     await client.connect()
                     if not await client.is_user_authorized():
-                        print("Re-authorization might be needed. Please restart if issues persist.")
+                        print("Re-authorization failed after reconnect. String session might be invalid.")
+                        return # Stop if re-auth fails
                     else:
                         print("Reconnected.")
 
@@ -101,6 +134,11 @@ async def main():
                 await asyncio.sleep(60)
             except Exception as e:
                 print(f"An error occurred: {e}")
+                # Check if it's an auth error that might indicate expired string session
+                if "AUTH_KEY_UNREGISTERED" in str(e).upper() or "SESSION_REVOKED" in str(e).upper():
+                    print("Authentication error detected. The session (string or file) may be revoked or expired.")
+                    print("Please generate a new session.")
+                    return # Stop the bot
                 print("Waiting a bit before trying again (60s)...")
                 await asyncio.sleep(60)
 
@@ -109,7 +147,7 @@ async def main():
     except Exception as e:
         print(f"A critical error occurred: {e}")
     finally:
-        if client.is_connected():
+        if client and client.is_connected(): # Check if client exists and is connected
             print("Setting status to offline before disconnecting...")
             try:
                 await client(UpdateStatusRequest(offline=True))
@@ -123,4 +161,8 @@ if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nExiting due to user interruption.")
+        print("\nExiting due to user interruption (Ctrl+C).")
+    except SystemExit:
+        print("Exiting due to internal sys.exit().")
+    except Exception as e:
+        print(f"Unhandled exception at top level: {e}")
